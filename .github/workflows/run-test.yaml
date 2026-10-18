@@ -2,19 +2,19 @@ name: Run tests
 
 on:
   # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  # (seal: push trigger replaced by workflow_dispatch so the fork only runs when dispatched)
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector forwarded to tox posargs"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       # run this job using this matrix
       matrix:
@@ -33,19 +33,32 @@ jobs:
           # See https://github.com/bbangert/beaker/pull/213
           - os: "windows-latest"
             python-version: "3.10"
+          # moved to macos-15-intel below
+          - os: "macos-latest"
+            python-version: "3.7"
+
+        include:
+          # no prebuilt CPython 3.7 for arm64 macos-latest and building it needs the removed
+          # homebrew openssl@1.1; the Intel image has a prebuilt x64 3.7
+          - os: "macos-15-intel"
+            python-version: "3.7"
 
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
+      # seal: MatteoH2O1999/setup-python is a drop-in for actions/setup-python that can
+      # provision old CPython (3.7-3.10) on arm64 macos-latest and ubuntu-24.04
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
@@ -53,5 +66,37 @@ jobs:
           pip install --upgrade tox setuptools
           pip list
 
+      # Pygments >= 2.20 changed HTML escaping of highlighted source, which breaks
+      # three test_exceptions.py html-error assertions written against 2022-era Pygments
+      - name: Constrain test dependencies
+        shell: bash
+        run: |
+          python -c "import os; p = os.path.abspath('test-constraints.txt'); open(p, 'w').write('pygments<2.20\n'); open(os.environ['GITHUB_ENV'], 'a').write('PIP_CONSTRAINT=' + p + '\n')"
+
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+      # seal: build the release sdist + wheel the way the published 1.2.4 was made:
+      # docs rendered into doc/ (make dist-html), egg_info tag_build cleared, sdist with
+      # setuptools 59.6.0, wheel with setuptools 65.5.1 + wheel 0.38.4.
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        shell: bash
+        run: |
+          TM='https://:2022-11-15T14:37:53Z@time-machines-pypi.sealsecurity.io/'
+          python -m pip install --index-url "$TM" "build==0.9.0" "wheel==0.38.4" "setuptools==59.6.0" "sphinx==5.3.0" zzzeeksphinx changelog sphinx-paramlinks
+          rm -rf build dist *.egg-info
+          (cd doc/build && make dist-html)
+          sed -i 's/^tag_build = dev$/tag_build =/' setup.cfg
+          python -m build --sdist --no-isolation
+          python -m pip install --index-url "$TM" "setuptools==65.5.1"
+          python -m build --wheel --no-isolation
+          ls -l dist
+
+      - name: Upload distributions
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
